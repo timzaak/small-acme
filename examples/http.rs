@@ -52,9 +52,6 @@ fn main() -> anyhow::Result<()> {
             _ => todo!(),
         }
 
-        // We'll use the DNS challenges for this example, but you could
-        // pick something else to use here.
-
         let challenge = authz
             .challenges
             .iter()

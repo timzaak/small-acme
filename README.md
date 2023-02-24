@@ -31,4 +31,4 @@ specification.
 
 ## Getting started
 
-See the [examples](examples) directory for an example of how to use small-acme.
+See the [examples](examples) directory for examples of how to use small-acme.
