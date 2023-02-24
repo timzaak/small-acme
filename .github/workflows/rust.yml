@@ -1,64 +1,62 @@
 name: CI
 
 on:
-  push:
-    branches: ['main']
-  pull_request:
-  schedule:
-    - cron: "25 6 * * 5"
+    push:
+        branches: ["main"]
+    pull_request:
 
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, beta, 1.64.0]
-        exclude:
-          - os: macos-latest
-            rust: beta
-          - os: windows-latest
-            rust: beta
-          - os: macos-latest
-            rust: 1.64.0
-          - os: windows-latest
-            rust: 1.64.0
+    test:
+        strategy:
+            matrix:
+                os: [ubuntu-latest, macos-latest, windows-latest]
+                rust: [stable, beta, nightly, 1.64.0]
+                exclude:
+                    - os: macos-latest
+                      rust: beta
+                    - os: windows-latest
+                      rust: beta
+                    - os: macos-latest
+                      rust: 1.64.0
+                    - os: windows-latest
+                      rust: 1.64.0
+                    - os: macos-latest
+                      rust: nightly
+                    - os: windows-latest
+                      rust: nightly
 
-    runs-on: ${{ matrix.os }}
+        runs-on: ${{ matrix.os }}
 
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.rust }}
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --all-features --all-targets
+        steps:
+            - uses: actions/checkout@v3
+            - uses: actions-rs/toolchain@v1
+              with:
+                  profile: minimal
+                  toolchain: ${{ matrix.rust }}
+                  override: true
+            - uses: Swatinem/rust-cache@v2
+            - run: cargo build --all-features --all-targets
 
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: rustfmt, clippy
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
-      - uses: actions-rs/cargo@v1
-        if: always()
-        with:
-          command: clippy
-          args: --workspace --all-targets --all-features -- -D warnings
+    lint:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v3
+            - uses: actions-rs/toolchain@v1
+              with:
+                  profile: minimal
+                  toolchain: stable
+                  override: true
+                  components: rustfmt, clippy
+            - uses: Swatinem/rust-cache@v2
+            - run: cargo fmt --all --check
+            - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+            - name: Checking doc references
+              uses: Icelk/rustdoc-link-check@v2
+              with:
+                  private: true
 
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v2
-    - uses: EmbarkStudios/cargo-deny-action@v1
+    audit:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v3
+            - uses: EmbarkStudios/cargo-deny-action@v1
