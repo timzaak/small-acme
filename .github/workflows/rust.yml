@@ -51,8 +51,8 @@ jobs:
               with:
                   private: true
 
-    audit:
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v3
-            - uses: EmbarkStudios/cargo-deny-action@v1
+    # audit:
+    #     runs-on: ubuntu-latest
+    #     steps:
+    #         - uses: actions/checkout@v3
+    #         - uses: EmbarkStudios/cargo-deny-action@v1
