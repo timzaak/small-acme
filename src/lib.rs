@@ -8,9 +8,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
-use hyper::client::HttpConnector;
-use hyper::header::{CONTENT_TYPE, LOCATION};
-use hyper::{Body, Method, Request, Response};
 use ring::digest::{digest, SHA256};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -25,6 +22,7 @@ pub use types::{
 use types::{
     DirectoryUrls, Empty, FinalizeRequest, Header, JoseJson, Jwk, KeyOrKeyId, SigningAlgorithm,
 };
+use ureq::Response;
 
 /// An ACME order as described in RFC 8555 (section 7.1.3)
 ///
@@ -55,13 +53,10 @@ impl Order {
     /// After the challenges have been set up, check the [`Order::state()`] to see
     /// if the order is ready to be finalized (or becomes invalid). Once it is
     /// ready, call `Order::finalize()` to get the certificate.
-    pub async fn authorizations(
-        &mut self,
-        authz_urls: &[String],
-    ) -> Result<Vec<Authorization>, Error> {
+    pub fn authorizations(&mut self, authz_urls: &[String]) -> Result<Vec<Authorization>, Error> {
         let mut authorizations = Vec::with_capacity(authz_urls.len());
         for url in authz_urls {
-            authorizations.push(self.account.get(&mut self.nonce, url).await?);
+            authorizations.push(self.account.get(&mut self.nonce, url)?);
         }
         Ok(authorizations)
     }
@@ -79,18 +74,15 @@ impl Order {
     /// Creating a CSR is outside of the scope of instant-acme. Make sure you pass in a
     /// DER representation of the CSR in `csr_der` and the [`OrderState::finalize`] URL
     /// in `finalize_url`. The resulting `String` will contain the PEM-encoded certificate chain.
-    pub async fn finalize(&mut self, csr_der: &[u8], finalize_url: &str) -> Result<String, Error> {
-        let rsp = self
-            .account
-            .post(
-                Some(&FinalizeRequest::new(csr_der)),
-                self.nonce.take(),
-                finalize_url,
-            )
-            .await?;
+    pub fn finalize(&mut self, csr_der: &[u8], finalize_url: &str) -> Result<String, Error> {
+        let rsp = self.account.post(
+            Some(&FinalizeRequest::new(csr_der)),
+            self.nonce.take(),
+            finalize_url,
+        )?;
 
         self.nonce = nonce_from_response(&rsp);
-        let state = Problem::check::<OrderState>(rsp).await?;
+        let state = Problem::check::<OrderState>(rsp)?;
 
         let cert_url = match state.certificate {
             Some(url) => url,
@@ -99,11 +91,10 @@ impl Order {
 
         let rsp = self
             .account
-            .post(None::<&Empty>, self.nonce.take(), &cert_url)
-            .await?;
+            .post(None::<&Empty>, self.nonce.take(), &cert_url)?;
 
         self.nonce = nonce_from_response(&rsp);
-        let body = hyper::body::to_bytes(Problem::from_response(rsp).await?).await?;
+        let body = Problem::from_response(rsp)?;
         Ok(
             String::from_utf8(body.to_vec())
                 .map_err(|_| "unable to decode certificate as UTF-8")?,
@@ -113,25 +104,24 @@ impl Order {
     /// Notify the server that the given challenge is ready to be completed
     ///
     /// `challenge_url` should be the `Challenge::url` field.
-    pub async fn set_challenge_ready(&mut self, challenge_url: &str) -> Result<(), Error> {
+    pub fn set_challenge_ready(&mut self, challenge_url: &str) -> Result<(), Error> {
         let rsp = self
             .account
-            .post(Some(&Empty {}), self.nonce.take(), challenge_url)
-            .await?;
+            .post(Some(&Empty {}), self.nonce.take(), challenge_url)?;
 
         self.nonce = nonce_from_response(&rsp);
-        let _ = Problem::check::<Challenge>(rsp).await?;
+        let _ = Problem::check::<Challenge>(rsp)?;
         Ok(())
     }
 
     /// Get the current state of the given challenge
-    pub async fn challenge(&mut self, challenge_url: &str) -> Result<Challenge, Error> {
-        self.account.get(&mut self.nonce, challenge_url).await
+    pub fn challenge(&mut self, challenge_url: &str) -> Result<Challenge, Error> {
+        self.account.get(&mut self.nonce, challenge_url)
     }
 
     /// Get the current state of the order
-    pub async fn state(&mut self) -> Result<OrderState, Error> {
-        self.account.get(&mut self.nonce, &self.order_url).await
+    pub fn state(&mut self) -> Result<OrderState, Error> {
+        self.account.get(&mut self.nonce, &self.order_url)
     }
 }
 
@@ -159,21 +149,15 @@ impl Account {
     }
 
     /// Create a new account on the `server_url` with the information in [`NewAccount`]
-    pub async fn create(account: &NewAccount<'_>, server_url: &str) -> Result<Account, Error> {
-        let client = Client::new(server_url).await?;
+    pub fn create(account: &NewAccount<'_>, server_url: &str) -> Result<Account, Error> {
+        let client = Client::new(server_url)?;
         let key = Key::generate()?;
-        let rsp = client
-            .post(Some(account), None, &key, &client.urls.new_account)
-            .await?;
+        let rsp = client.post(Some(account), None, &key, &client.urls.new_account)?;
 
-        let account_url = rsp
-            .headers()
-            .get(LOCATION)
-            .and_then(|hv| hv.to_str().ok())
-            .map(|s| s.to_owned());
+        let account_url = rsp.header("location").map(ToOwned::to_owned);
 
         // The response redirects, we don't need the body
-        let _ = Problem::from_response(rsp).await?;
+        let _ = Problem::from_response(rsp)?;
         Ok(Self {
             inner: Arc::new(AccountInner {
                 client,
@@ -186,23 +170,15 @@ impl Account {
     /// Create a new order based on the given [`NewOrder`]
     ///
     /// Returns both an [`Order`] instance and the initial [`OrderState`].
-    pub async fn new_order<'a>(
-        &'a self,
-        order: &NewOrder<'_>,
-    ) -> Result<(Order, OrderState), Error> {
+    pub fn new_order(&self, order: &NewOrder) -> Result<(Order, OrderState), Error> {
         let rsp = self
             .inner
-            .post(Some(order), None, &self.inner.client.urls.new_order)
-            .await?;
+            .post(Some(order), None, &self.inner.client.urls.new_order)?;
 
         let nonce = nonce_from_response(&rsp);
-        let order_url = rsp
-            .headers()
-            .get(LOCATION)
-            .and_then(|hv| hv.to_str().ok())
-            .map(|s| s.to_owned());
+        let order_url = rsp.header("location").map(ToOwned::to_owned);
 
-        let status = Problem::check(rsp).await?;
+        let status = Problem::check(rsp)?;
         Ok((
             Order {
                 account: self.inner.clone(),
@@ -239,23 +215,19 @@ impl AccountInner {
         })
     }
 
-    async fn get<T: DeserializeOwned>(
-        &self,
-        nonce: &mut Option<String>,
-        url: &str,
-    ) -> Result<T, Error> {
-        let rsp = self.post(None::<&Empty>, nonce.take(), url).await?;
+    fn get<T: DeserializeOwned>(&self, nonce: &mut Option<String>, url: &str) -> Result<T, Error> {
+        let rsp = self.post(None::<&Empty>, nonce.take(), url)?;
         *nonce = nonce_from_response(&rsp);
-        Problem::check(rsp).await
+        Problem::check(rsp)
     }
 
-    async fn post(
+    fn post(
         &self,
         payload: Option<&impl Serialize>,
         nonce: Option<String>,
         url: &str,
-    ) -> Result<Response<Body>, Error> {
-        self.client.post(payload, nonce, self, url).await
+    ) -> Result<Response, Error> {
+        self.client.post(payload, nonce, self, url)
     }
 
     fn credentials(&self) -> AccountCredentials<'_> {
@@ -284,48 +256,42 @@ impl Signer for AccountInner {
 
 #[derive(Debug)]
 struct Client {
-    client: hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>>,
+    client: ureq::Agent,
     urls: DirectoryUrls,
 }
 
 impl Client {
-    async fn new(server_url: &str) -> Result<Self, Error> {
+    fn new(server_url: &str) -> Result<Self, Error> {
         let client = client();
-        let rsp = client.get(server_url.parse()?).await?;
-        let body = hyper::body::to_bytes(rsp.into_body()).await?;
-        Ok(Client {
-            client,
-            urls: serde_json::from_slice(&body)?,
-        })
+        let rsp = client.get(server_url).call()?;
+        let urls = rsp.into_json()?;
+        Ok(Client { client, urls })
     }
 
-    async fn post(
+    fn post(
         &self,
         payload: Option<&impl Serialize>,
         mut nonce: Option<String>,
         signer: &impl Signer,
         url: &str,
-    ) -> Result<Response<Body>, Error> {
+    ) -> Result<Response, Error> {
         if nonce.is_none() {
-            let request = Request::builder()
-                .method(Method::HEAD)
-                .uri(&self.urls.new_nonce)
-                .body(Body::empty())
-                .unwrap();
-
-            let rsp = self.client.request(request).await?;
+            let rsp = self
+                .client
+                .request("HEAD", &self.urls.new_nonce)
+                .send_string("")?;
             nonce = nonce_from_response(&rsp);
         };
 
         let nonce = nonce.ok_or("no nonce found")?;
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(url)
-            .header(CONTENT_TYPE, JOSE_JSON)
-            .body(signer.signed_json(payload, &nonce, url)?)
+        let rsp = self
+            .client
+            .request("POST", url)
+            .set("content-type", JOSE_JSON)
+            .send_json(signer.signed_json(payload, &nonce, url)?)
             .unwrap();
 
-        Ok(self.client.request(request).await?)
+        Ok(rsp)
     }
 }
 
@@ -370,7 +336,7 @@ impl Key {
         &self,
         payload: Option<&impl Serialize>,
         protected: Header<'_>,
-    ) -> Result<Body, Error> {
+    ) -> Result<JoseJson, Error> {
         let protected = base64(&protected)?;
         let payload = match payload {
             Some(data) => base64(&data)?,
@@ -379,11 +345,11 @@ impl Key {
 
         let combined = format!("{protected}.{payload}");
         let signature = self.inner.sign(&self.rng, combined.as_bytes())?;
-        Ok(Body::from(serde_json::to_vec(&JoseJson {
+        Ok(JoseJson {
             protected,
             payload,
             signature: BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref()),
-        })?))
+        })
     }
 }
 
@@ -408,7 +374,7 @@ trait Signer {
         payload: Option<&impl Serialize>,
         nonce: &str,
         url: &str,
-    ) -> Result<Body, Error> {
+    ) -> Result<JoseJson, Error> {
         self.key().signed_json(payload, self.header(nonce, url))
     }
 
@@ -459,25 +425,16 @@ impl fmt::Debug for KeyAuthorization {
     }
 }
 
-fn nonce_from_response(rsp: &Response<Body>) -> Option<String> {
-    rsp.headers()
-        .get(REPLAY_NONCE)
-        .and_then(|hv| String::from_utf8(hv.as_ref().to_vec()).ok())
+fn nonce_from_response(rsp: &Response) -> Option<String> {
+    rsp.header(REPLAY_NONCE).map(ToOwned::to_owned)
 }
 
 fn base64(data: &impl Serialize) -> Result<String, serde_json::Error> {
     Ok(BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(data)?))
 }
 
-fn client() -> hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>> {
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .https_only()
-        .enable_http1()
-        .enable_http2()
-        .build();
-
-    hyper::Client::builder().build(https)
+fn client() -> ureq::Agent {
+    ureq::builder().https_only(true).build()
 }
 
 const JOSE_JSON: &str = "application/jose+json";

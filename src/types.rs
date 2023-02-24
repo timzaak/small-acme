@@ -2,12 +2,12 @@ use std::borrow::Cow;
 use std::fmt;
 
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
-use hyper::{Body, Response};
 use ring::digest::{digest, Digest, SHA256};
 use ring::signature::{EcdsaKeyPair, KeyPair};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ureq::Response;
 
 /// Error type for instant-acme
 #[derive(Debug, Error)]
@@ -28,16 +28,21 @@ pub enum Error {
     CryptoKey(#[from] ring::error::KeyRejected),
     /// HTTP request failure
     #[error("HTTP request failure: {0}")]
-    Http(#[from] hyper::Error),
-    /// Invalid ACME server URL
-    #[error("invalid URI: {0}")]
-    InvalidUri(#[from] hyper::http::uri::InvalidUri),
+    Http(#[from] Box<ureq::Error>),
+    /// HTTP IO failure
+    #[error("HTTP IO failure: {0}")]
+    HttpIo(#[from] std::io::Error),
     /// Failed to (de)serialize a JSON object
     #[error("failed to (de)serialize JSON: {0}")]
     Json(#[from] serde_json::Error),
     /// Miscellaneous errors
     #[error("missing data: {0}")]
     Str(&'static str),
+}
+impl From<ureq::Error> for Error {
+    fn from(value: ureq::Error) -> Self {
+        Self::Http(Box::new(value))
+    }
 }
 
 impl From<&'static str> for Error {
@@ -74,20 +79,18 @@ pub struct Problem {
 }
 
 impl Problem {
-    pub(crate) async fn check<T: DeserializeOwned>(rsp: Response<Body>) -> Result<T, Error> {
-        Ok(serde_json::from_slice(
-            &hyper::body::to_bytes(Self::from_response(rsp).await?).await?,
-        )?)
+    pub(crate) fn check<T: DeserializeOwned>(rsp: Response) -> Result<T, Error> {
+        rsp.into_json().map_err(Error::HttpIo)
     }
 
-    pub(crate) async fn from_response(rsp: Response<Body>) -> Result<Body, Error> {
+    pub(crate) fn from_response(rsp: Response) -> Result<Vec<u8>, Error> {
         let status = rsp.status();
-        let body = rsp.into_body();
-        if status.is_informational() || status.is_success() || status.is_redirection() {
+        let mut body = Vec::new();
+        rsp.into_reader().read_to_end(&mut body)?;
+        if (100..=399).contains(&status) {
             return Ok(body);
         }
 
-        let body = hyper::body::to_bytes(body).await?;
         Err(serde_json::from_slice::<Problem>(&body)?.into())
     }
 }

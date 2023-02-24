@@ -1,18 +1,17 @@
+use std::thread::sleep;
 use std::{io, time::Duration};
 
 use clap::Parser;
+use log::{error, info};
 use rcgen::{Certificate, CertificateParams, DistinguishedName};
-use tokio::time::sleep;
-use tracing::{error, info};
 
-use instant_acme::{
+use small_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
     OrderStatus,
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let opts = Options::parse();
 
     // Create a new account. This will generate a fresh ECDSA key for you.
@@ -26,8 +25,7 @@ async fn main() -> anyhow::Result<()> {
             only_return_existing: false,
         },
         LetsEncrypt::Staging.url(),
-    )
-    .await?;
+    )?;
 
     // Create the ACME order based on the given domain names.
     // Note that this only needs an `&Account`, so the library will let you
@@ -38,7 +36,6 @@ async fn main() -> anyhow::Result<()> {
         .new_order(&NewOrder {
             identifiers: &[identifier],
         })
-        .await
         .unwrap();
 
     info!("order state: {:#?}", state);
@@ -46,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Pick the desired challenge type and prepare the response.
 
-    let authorizations = order.authorizations(&state.authorizations).await.unwrap();
+    let authorizations = order.authorizations(&state.authorizations).unwrap();
     let mut challenges = Vec::with_capacity(authorizations.len());
     for authz in &authorizations {
         match authz.status {
@@ -80,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     // Let the server know we're ready to accept the challenges.
 
     for (_, url) in &challenges {
-        order.set_challenge_ready(url).await.unwrap();
+        order.set_challenge_ready(url).unwrap();
     }
 
     // Exponentially back off until the order becomes ready or invalid.
@@ -88,8 +85,8 @@ async fn main() -> anyhow::Result<()> {
     let mut tries = 1u8;
     let mut delay = Duration::from_millis(250);
     let state = loop {
-        sleep(delay).await;
-        let state = order.state().await.unwrap();
+        sleep(delay);
+        let state = order.state().unwrap();
         if let OrderStatus::Ready | OrderStatus::Invalid = state.status {
             info!("order state: {:#?}", state);
             break state;
@@ -98,9 +95,9 @@ async fn main() -> anyhow::Result<()> {
         delay *= 2;
         tries += 1;
         match tries < 5 {
-            true => info!(?state, tries, "order is not ready, waiting {delay:?}"),
+            true => info!("order is not ready, waiting {delay:?} {state:?} {tries}"),
             false => {
-                error!(?state, tries, "order is not ready");
+                error!("order is not ready {state:?} {tries}");
                 return Err(anyhow::anyhow!("order is not ready"));
             }
         }
@@ -125,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Finalize the order and print certificate chain, private key and account credentials.
 
-    let cert_chain_pem = order.finalize(&csr, &state.finalize).await.unwrap();
+    let cert_chain_pem = order.finalize(&csr, &state.finalize).unwrap();
     info!("certficate chain:\n\n{}", cert_chain_pem,);
     info!("private key:\n\n{}", cert.serialize_private_key_pem());
     info!(
