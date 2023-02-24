@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ureq::Response;
 
-/// Error type for instant-acme
+/// Error type for small-acme
 #[derive(Debug, Error)]
 pub enum Error {
     /// An JSON problem as returned by the ACME server

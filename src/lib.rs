@@ -71,7 +71,7 @@ impl Order {
 
     /// Request a certificate from the given Certificate Signing Request (CSR)
     ///
-    /// Creating a CSR is outside of the scope of instant-acme. Make sure you pass in a
+    /// Creating a CSR is outside of the scope of small-acme. Make sure you pass in a
     /// DER representation of the CSR in `csr_der` and the [`OrderState::finalize`] URL
     /// in `finalize_url`. The resulting `String` will contain the PEM-encoded certificate chain.
     pub fn finalize(&mut self, csr_der: &[u8], finalize_url: &str) -> Result<String, Error> {
