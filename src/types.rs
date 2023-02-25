@@ -27,7 +27,7 @@ pub enum Error {
     #[error("invalid key bytes: {0}")]
     CryptoKey(#[from] ring::error::KeyRejected),
     /// HTTP request failure
-    #[error("HTTP request failure: {0}")]
+    #[error("HTTP request failure: {0:?}")]
     Http(#[from] Box<ureq::Error>),
     /// HTTP IO failure
     #[error("HTTP IO failure: {0}")]
