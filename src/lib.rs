@@ -288,8 +288,7 @@ impl Client {
             .client
             .request("POST", url)
             .set("content-type", JOSE_JSON)
-            .send_json(signer.signed_json(payload, &nonce, url)?)
-            .unwrap();
+            .send_json(signer.signed_json(payload, &nonce, url)?)?;
 
         Ok(rsp)
     }
