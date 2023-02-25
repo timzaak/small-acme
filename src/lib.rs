@@ -23,6 +23,7 @@ use types::{
     DirectoryUrls, Empty, FinalizeRequest, Header, JoseJson, Jwk, KeyOrKeyId, SigningAlgorithm,
 };
 use ureq::Response;
+pub use ureq;
 
 /// An ACME order as described in RFC 8555 (section 7.1.3)
 ///
