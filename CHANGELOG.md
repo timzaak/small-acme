@@ -1,3 +1,7 @@
+# v0.1.2
+
+-   Re-export `ureq`, which allows dependants to e.g. match errors
+
 # v0.1.1
 
 -   Fix panic when order failed
