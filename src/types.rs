@@ -58,7 +58,7 @@ impl From<&'static str> for Error {
 /// server URLs from the relevant ACME server. This can be used to serialize
 /// the account credentials to a file or secret manager and restore the
 /// account from persistent storage.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct AccountCredentials {
     pub(crate) id: String,
     /// Stored in DER, serialized as base64
