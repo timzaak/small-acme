@@ -13,7 +13,7 @@ jobs:
         strategy:
             matrix:
                 os: [ubuntu-latest, macos-latest, windows-latest]
-                rust: [stable, beta, nightly, 1.64.0]
+                rust: [stable, beta, nightly]
                 exclude:
                     - os: macos-latest
                       rust: beta
