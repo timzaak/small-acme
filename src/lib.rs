@@ -3,6 +3,8 @@
 #![warn(unreachable_pub)]
 #![warn(missing_docs)]
 
+pub use ureq;
+
 use std::fmt;
 use std::sync::Arc;
 
