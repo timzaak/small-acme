@@ -1,9 +1,8 @@
-//! Async pure-Rust ACME (RFC 8555) client.
+//! Sync pure-Rust ACME (RFC 8555) client.
 
 #![warn(unreachable_pub)]
 #![warn(missing_docs)]
 
-use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
@@ -11,6 +10,7 @@ use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use ring::digest::{digest, SHA256};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::{hmac, pkcs8};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -18,11 +18,12 @@ mod types;
 pub use types::{
     AccountCredentials, Authorization, AuthorizationStatus, Challenge, ChallengeType, Error,
     Identifier, LetsEncrypt, NewAccount, NewOrder, OrderState, OrderStatus, Problem,
+    RevocationReason, RevocationRequest, ZeroSsl,
 };
 use types::{
-    DirectoryUrls, Empty, FinalizeRequest, Header, JoseJson, Jwk, KeyOrKeyId, SigningAlgorithm,
+    DirectoryUrls, Empty, FinalizeRequest, Header, JoseJson, Jwk, KeyOrKeyId, NewAccountPayload,
+    Signer, SigningAlgorithm,
 };
-pub use ureq;
 use ureq::Response;
 
 /// An ACME order as described in RFC 8555 (section 7.1.3)
@@ -35,7 +36,8 @@ use ureq::Response;
 pub struct Order {
     account: Arc<AccountInner>,
     nonce: Option<String>,
-    order_url: String,
+    url: String,
+    state: OrderState,
 }
 
 impl Order {
@@ -54,9 +56,9 @@ impl Order {
     /// After the challenges have been set up, check the [`Order::state()`] to see
     /// if the order is ready to be finalized (or becomes invalid). Once it is
     /// ready, call `Order::finalize()` to get the certificate.
-    pub fn authorizations(&mut self, authz_urls: &[String]) -> Result<Vec<Authorization>, Error> {
-        let mut authorizations = Vec::with_capacity(authz_urls.len());
-        for url in authz_urls {
+    pub fn authorizations(&mut self) -> Result<Vec<Authorization>, Error> {
+        let mut authorizations = Vec::with_capacity(self.state.authorizations.len());
+        for url in &self.state.authorizations {
             authorizations.push(self.account.get(&mut self.nonce, url)?);
         }
         Ok(authorizations)
@@ -72,34 +74,60 @@ impl Order {
 
     /// Request a certificate from the given Certificate Signing Request (CSR)
     ///
-    /// Creating a CSR is outside of the scope of small-acme. Make sure you pass in a
-    /// DER representation of the CSR in `csr_der` and the [`OrderState::finalize`] URL
-    /// in `finalize_url`. The resulting `String` will contain the PEM-encoded certificate chain.
-    pub fn finalize(&mut self, csr_der: &[u8], finalize_url: &str) -> Result<String, Error> {
+    /// Creating a CSR is outside of the scope of instant-acme. Make sure you pass in a
+    /// DER representation of the CSR in `csr_der`. Call `certificate()` to retrieve the
+    /// certificate chain once the order is in the appropriate state.
+    pub fn finalize(&mut self, csr_der: &[u8]) -> Result<(), Error> {
         let rsp = self.account.post(
             Some(&FinalizeRequest::new(csr_der)),
             self.nonce.take(),
-            finalize_url,
+            &self.state.finalize,
         )?;
 
         self.nonce = nonce_from_response(&rsp);
-        let state = Problem::check::<OrderState>(rsp)?;
+        self.state = Problem::check::<OrderState>(rsp)?;
+        Ok(())
+    }
 
-        let cert_url = match state.certificate {
-            Some(url) => url,
-            None => return Err(Error::Str("no certificate URL")),
+    /// Get the certificate for this order
+    ///
+    /// If the cached order state is in `ready` or `processing` state, this will poll the server
+    /// for the latest state. If the order is still in `processing` state after that, this will
+    /// return `Ok(None)`. If the order is in `valid` state, this will attempt to retrieve
+    /// the certificate from the server and return it as a `String`. If the order contains
+    /// an error or ends up in any state other than `valid` or `processing`, return an error.
+    pub fn certificate(&mut self) -> Result<Option<String>, Error> {
+        if matches!(self.state.status, OrderStatus::Processing) {
+            let rsp = self
+                .account
+                .post(None::<&Empty>, self.nonce.take(), &self.url)?;
+            self.nonce = nonce_from_response(&rsp);
+            self.state = Problem::check::<OrderState>(rsp)?;
+        }
+
+        if let Some(error) = &self.state.error {
+            return Err(Error::Api(error.clone()));
+        } else if self.state.status == OrderStatus::Processing {
+            return Ok(None);
+        } else if self.state.status != OrderStatus::Valid {
+            return Err(Error::Str("invalid order state"));
+        }
+
+        let cert_url = match &self.state.certificate {
+            Some(cert_url) => cert_url,
+            None => return Err(Error::Str("no certificate URL found")),
         };
 
         let rsp = self
             .account
-            .post(None::<&Empty>, self.nonce.take(), &cert_url)?;
+            .post(None::<&Empty>, self.nonce.take(), cert_url)?;
 
         self.nonce = nonce_from_response(&rsp);
         let body = Problem::from_response(rsp)?;
-        Ok(
+        Ok(Some(
             String::from_utf8(body.to_vec())
                 .map_err(|_| "unable to decode certificate as UTF-8")?,
-        )
+        ))
     }
 
     /// Notify the server that the given challenge is ready to be completed
@@ -120,9 +148,27 @@ impl Order {
         self.account.get(&mut self.nonce, challenge_url)
     }
 
-    /// Get the current state of the order
-    pub fn state(&mut self) -> Result<OrderState, Error> {
-        self.account.get(&mut self.nonce, &self.order_url)
+    /// Refresh the current state of the order
+    pub fn refresh(&mut self) -> Result<&OrderState, Error> {
+        let rsp = self
+            .account
+            .post(None::<&Empty>, self.nonce.take(), &self.url)?;
+
+        self.nonce = nonce_from_response(&rsp);
+        self.state = Problem::check::<OrderState>(rsp)?;
+        Ok(&self.state)
+    }
+
+    /// Get the last known state of the order
+    ///
+    /// Call `refresh()` to get the latest state from the server.
+    pub fn state(&mut self) -> &OrderState {
+        &self.state
+    }
+
+    /// Get the URL of the order
+    pub fn url(&self) -> &str {
+        &self.url
     }
 }
 
@@ -140,61 +186,130 @@ pub struct Account {
 }
 
 impl Account {
-    /// Restore an existing account from the given credentials
+    /// Restore an existing account from the given credentials and HTTP client
     ///
     /// The [`AccountCredentials`] type is opaque, but supports deserialization.
-    pub fn from_credentials(credentials: AccountCredentials<'_>) -> Result<Self, Error> {
+    pub fn from_credentials(credentials: AccountCredentials) -> Result<Self, Error> {
         Ok(Self {
             inner: Arc::new(AccountInner::from_credentials(credentials)?),
         })
     }
 
-    /// Create a new account on the `server_url` with the information in [`NewAccount`]
-    pub fn create(account: &NewAccount<'_>, server_url: &str) -> Result<Account, Error> {
-        let client = Client::new(server_url)?;
-        let key = Key::generate()?;
-        let rsp = client.post(Some(account), None, &key, &client.urls.new_account)?;
-
-        let account_url = rsp.header("location").map(ToOwned::to_owned);
-
-        // The response redirects, we don't need the body
-        let _ = Problem::from_response(rsp)?;
+    /// Restore an existing account from the given ID, private key, server URL and HTTP client
+    ///
+    /// The key must be provided in DER-encoded PKCS#8. This is usually how ECDSA keys are
+    /// encoded in PEM files. Use a crate like rustls-pemfile to decode from PEM to DER.
+    pub fn from_parts(
+        id: String,
+        key_pkcs8_der: &[u8],
+        directory_url: &str,
+    ) -> Result<Self, Error> {
         Ok(Self {
             inner: Arc::new(AccountInner {
-                client,
-                key,
-                id: account_url.ok_or("failed to get account URL")?,
+                id,
+                key: Key::from_pkcs8_der(key_pkcs8_der)?,
+                client: Client::new(directory_url)?,
             }),
         })
     }
 
+    /// Create a new account with a custom HTTP client
+    ///
+    /// The returned [`AccountCredentials`] can be serialized and stored for later use.
+    /// Use [`Account::from_credentials()`] to restore the account from the credentials.
+    pub fn create(
+        account: &NewAccount<'_>,
+        server_url: &str,
+        external_account: Option<&ExternalAccountKey>,
+    ) -> Result<(Account, AccountCredentials), Error> {
+        Self::create_inner(
+            account,
+            external_account,
+            Client::new(server_url)?,
+            server_url,
+        )
+    }
+
+    fn create_inner(
+        account: &NewAccount<'_>,
+        external_account: Option<&ExternalAccountKey>,
+        client: Client,
+        server_url: &str,
+    ) -> Result<(Account, AccountCredentials), Error> {
+        let (key, key_pkcs8) = Key::generate()?;
+        let payload = NewAccountPayload {
+            new_account: account,
+            external_account_binding: external_account
+                .map(|eak| {
+                    JoseJson::new(
+                        Some(&Jwk::new(&key.inner)),
+                        eak.header(None, &client.urls.new_account),
+                        eak,
+                    )
+                })
+                .transpose()?,
+        };
+
+        let rsp = client.post(Some(&payload), None, &key, &client.urls.new_account)?;
+
+        let account_url = rsp.header("LOCATION").map(|s| s.to_owned());
+
+        // The response redirects, we don't need the body
+        let _ = Problem::from_response(rsp)?;
+        let id = account_url.ok_or("failed to get account URL")?;
+        let credentials = AccountCredentials {
+            id: id.clone(),
+            key_pkcs8: key_pkcs8.as_ref().to_vec(),
+            directory: Some(server_url.to_owned()),
+            // We support deserializing URLs for compatibility with versions pre 0.4,
+            // but we prefer to get fresh URLs from the `server_url` for newer credentials.
+            urls: None,
+        };
+
+        let account = AccountInner {
+            client,
+            key,
+            id: id.clone(),
+        };
+
+        Ok((
+            Self {
+                inner: Arc::new(account),
+            },
+            credentials,
+        ))
+    }
+
     /// Create a new order based on the given [`NewOrder`]
     ///
-    /// Returns both an [`Order`] instance and the initial [`OrderState`].
-    pub fn new_order(&self, order: &NewOrder) -> Result<(Order, OrderState), Error> {
+    /// Returns an [`Order`] instance. Use the [`Order::state()`] method to inspect its state.
+    pub fn new_order(&self, order: &NewOrder<'_>) -> Result<Order, Error> {
         let rsp = self
             .inner
             .post(Some(order), None, &self.inner.client.urls.new_order)?;
 
         let nonce = nonce_from_response(&rsp);
-        let order_url = rsp.header("location").map(ToOwned::to_owned);
+        let order_url = rsp.header("LOCATION").map(|s| s.to_owned());
 
-        let status = Problem::check(rsp)?;
-        Ok((
-            Order {
-                account: self.inner.clone(),
-                nonce,
-                order_url: order_url.ok_or("no order URL found")?,
-            },
-            status,
-        ))
+        Ok(Order {
+            account: self.inner.clone(),
+            nonce,
+            // Order of fields matters! We return errors from Problem::check
+            // before emitting an error if there is no order url. Or the
+            // simple no url error hides the causing error in `Problem::check`.
+            state: Problem::check::<OrderState>(rsp)?,
+            url: order_url.ok_or("no order URL found")?,
+        })
     }
 
-    /// Get the account's credentials, which can be serialized
-    ///
-    /// Pass the credentials to [`Account::from_credentials`] to regain access to the `Account`.
-    pub fn credentials(&self) -> AccountCredentials<'_> {
-        self.inner.credentials()
+    /// Revokes a previously issued certificate
+    pub fn revoke<'a>(&'a self, payload: &RevocationRequest<'a>) -> Result<(), Error> {
+        let rsp = self
+            .inner
+            .post(Some(payload), None, &self.inner.client.urls.revoke_cert)?;
+        // The body is empty if the request was successful
+        let _ = Problem::from_response(rsp)?;
+        Ok(())
     }
 }
 
@@ -205,14 +320,18 @@ struct AccountInner {
 }
 
 impl AccountInner {
-    fn from_credentials(credentials: AccountCredentials<'_>) -> Result<Self, Error> {
+    fn from_credentials(credentials: AccountCredentials) -> Result<Self, Error> {
         Ok(Self {
-            key: Key::from_pkcs8_der(BASE64_URL_SAFE_NO_PAD.decode(&credentials.key_pkcs8)?)?,
-            client: Client {
-                client: client(),
-                urls: credentials.urls.into_owned(),
+            id: credentials.id,
+            key: Key::from_pkcs8_der(credentials.key_pkcs8.as_ref())?,
+            client: match (credentials.directory, credentials.urls) {
+                (Some(server_url), _) => Client::new(&server_url)?,
+                (None, Some(urls)) => Client {
+                    client: client(),
+                    urls,
+                },
+                (None, None) => return Err("no server URLs found".into()),
             },
-            id: credentials.id.into_owned(),
         })
     }
 
@@ -230,18 +349,13 @@ impl AccountInner {
     ) -> Result<Response, Error> {
         self.client.post(payload, nonce, self, url)
     }
-
-    fn credentials(&self) -> AccountCredentials<'_> {
-        AccountCredentials {
-            id: Cow::Borrowed(&self.id),
-            key_pkcs8: BASE64_URL_SAFE_NO_PAD.encode(&self.key.pkcs8_der),
-            urls: Cow::Borrowed(&self.client.urls),
-        }
-    }
 }
 
 impl Signer for AccountInner {
-    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: &'n str, url: &'u str) -> Header<'n> {
+    type Signature = <Key as Signer>::Signature;
+
+    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: Option<&'n str>, url: &'u str) -> Header<'n> {
+        debug_assert!(nonce.is_some());
         Header {
             alg: self.key.signing_algorithm,
             key: KeyOrKeyId::KeyId(&self.id),
@@ -250,12 +364,11 @@ impl Signer for AccountInner {
         }
     }
 
-    fn key(&self) -> &Key {
-        &self.key
+    fn sign(&self, payload: &[u8]) -> Result<Self::Signature, Error> {
+        self.key.sign(payload)
     }
 }
 
-#[derive(Debug)]
 struct Client {
     client: ureq::Agent,
     urls: DirectoryUrls,
@@ -272,26 +385,46 @@ impl Client {
     fn post(
         &self,
         payload: Option<&impl Serialize>,
-        mut nonce: Option<String>,
+        nonce: Option<String>,
         signer: &impl Signer,
         url: &str,
     ) -> Result<Response, Error> {
-        if nonce.is_none() {
-            let rsp = self
-                .client
-                .request("HEAD", &self.urls.new_nonce)
-                .send_string("")?;
-            nonce = nonce_from_response(&rsp);
-        };
-
-        let nonce = nonce.ok_or("no nonce found")?;
+        let nonce = self.nonce(nonce)?;
+        let body = JoseJson::new(payload, signer.header(Some(&nonce), url), signer)?;
         let rsp = self
             .client
             .request("POST", url)
-            .set("content-type", JOSE_JSON)
-            .send_json(signer.signed_json(payload, &nonce, url)?)?;
-
+            .set("CONTENT-TYPE", JOSE_JSON)
+            .send_json(body)?;
         Ok(rsp)
+    }
+
+    fn nonce(&self, nonce: Option<String>) -> Result<String, Error> {
+        if let Some(nonce) = nonce {
+            return Ok(nonce);
+        }
+
+        let rsp = self.client.request("HEAD", &self.urls.new_nonce).call()?;
+        // https://datatracker.ietf.org/doc/html/rfc8555#section-7.2
+        // "The server's response MUST include a Replay-Nonce header field containing a fresh
+        // nonce and SHOULD have status code 200 (OK)."
+        if rsp.status() != 200 {
+            return Err("error response from newNonce resource".into());
+        }
+
+        match nonce_from_response(&rsp) {
+            Some(nonce) => Ok(nonce),
+            None => Err("no nonce found in newNonce response".into()),
+        }
+    }
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("client", &"..")
+            .field("urls", &self.urls)
+            .finish()
     }
 }
 
@@ -299,62 +432,46 @@ struct Key {
     rng: SystemRandom,
     signing_algorithm: SigningAlgorithm,
     inner: EcdsaKeyPair,
-    pkcs8_der: Vec<u8>,
     thumb: String,
 }
 
 impl Key {
-    fn generate() -> Result<Self, Error> {
+    fn generate() -> Result<(Self, pkcs8::Document), Error> {
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)?;
-        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())?;
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)?;
+        let thumb = BASE64_URL_SAFE_NO_PAD.encode(Jwk::thumb_sha256(&key)?);
+
+        Ok((
+            Self {
+                rng,
+                signing_algorithm: SigningAlgorithm::Es256,
+                inner: key,
+                thumb,
+            },
+            pkcs8,
+        ))
+    }
+
+    fn from_pkcs8_der(pkcs8_der: &[u8]) -> Result<Self, Error> {
+        let rng = SystemRandom::new();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8_der, &rng)?;
         let thumb = BASE64_URL_SAFE_NO_PAD.encode(Jwk::thumb_sha256(&key)?);
 
         Ok(Self {
             rng,
             signing_algorithm: SigningAlgorithm::Es256,
             inner: key,
-            pkcs8_der: pkcs8.as_ref().to_vec(),
             thumb,
-        })
-    }
-
-    fn from_pkcs8_der(pkcs8_der: Vec<u8>) -> Result<Self, Error> {
-        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8_der)?;
-        let thumb = BASE64_URL_SAFE_NO_PAD.encode(Jwk::thumb_sha256(&key)?);
-
-        Ok(Self {
-            rng: SystemRandom::new(),
-            signing_algorithm: SigningAlgorithm::Es256,
-            inner: key,
-            pkcs8_der,
-            thumb,
-        })
-    }
-
-    fn signed_json(
-        &self,
-        payload: Option<&impl Serialize>,
-        protected: Header<'_>,
-    ) -> Result<JoseJson, Error> {
-        let protected = base64(&protected)?;
-        let payload = match payload {
-            Some(data) => base64(&data)?,
-            None => String::new(),
-        };
-
-        let combined = format!("{protected}.{payload}");
-        let signature = self.inner.sign(&self.rng, combined.as_bytes())?;
-        Ok(JoseJson {
-            protected,
-            payload,
-            signature: BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref()),
         })
     }
 }
 
 impl Signer for Key {
-    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: &'n str, url: &'u str) -> Header<'n> {
+    type Signature = ring::signature::Signature;
+
+    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: Option<&'n str>, url: &'u str) -> Header<'n> {
+        debug_assert!(nonce.is_some());
         Header {
             alg: self.signing_algorithm,
             key: KeyOrKeyId::from_key(&self.inner),
@@ -363,24 +480,9 @@ impl Signer for Key {
         }
     }
 
-    fn key(&self) -> &Key {
-        self
+    fn sign(&self, payload: &[u8]) -> Result<Self::Signature, Error> {
+        Ok(self.inner.sign(&self.rng, payload)?)
     }
-}
-
-trait Signer {
-    fn signed_json(
-        &self,
-        payload: Option<&impl Serialize>,
-        nonce: &str,
-        url: &str,
-    ) -> Result<JoseJson, Error> {
-        self.key().signed_json(payload, self.header(nonce, url))
-    }
-
-    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: &'n str, url: &'u str) -> Header<'n>;
-
-    fn key(&self) -> &Key;
 }
 
 /// The response value to use for challenge responses
@@ -425,12 +527,44 @@ impl fmt::Debug for KeyAuthorization {
     }
 }
 
-fn nonce_from_response(rsp: &Response) -> Option<String> {
-    rsp.header(REPLAY_NONCE).map(ToOwned::to_owned)
+/// A HMAC key used to link account creation requests to an external account
+///
+/// See RFC 8555 section 7.3.4 for more information.
+pub struct ExternalAccountKey {
+    id: String,
+    key: hmac::Key,
 }
 
-fn base64(data: &impl Serialize) -> Result<String, serde_json::Error> {
-    Ok(BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(data)?))
+impl ExternalAccountKey {
+    /// Create a new external account key
+    pub fn new(id: String, key_value: &[u8]) -> Self {
+        Self {
+            id,
+            key: hmac::Key::new(hmac::HMAC_SHA256, key_value),
+        }
+    }
+}
+
+impl Signer for ExternalAccountKey {
+    type Signature = hmac::Tag;
+
+    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: Option<&'n str>, url: &'u str) -> Header<'n> {
+        debug_assert_eq!(nonce, None);
+        Header {
+            alg: SigningAlgorithm::Hs256,
+            key: KeyOrKeyId::KeyId(&self.id),
+            nonce,
+            url,
+        }
+    }
+
+    fn sign(&self, payload: &[u8]) -> Result<Self::Signature, Error> {
+        Ok(hmac::sign(&self.key, payload))
+    }
+}
+
+fn nonce_from_response(rsp: &Response) -> Option<String> {
+    rsp.header(REPLAY_NONCE).map(ToOwned::to_owned)
 }
 
 fn client() -> ureq::Agent {
@@ -439,3 +573,22 @@ fn client() -> ureq::Agent {
 
 const JOSE_JSON: &str = "application/jose+json";
 const REPLAY_NONCE: &str = "Replay-Nonce";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_old_credentials() -> Result<(), Error> {
+        const CREDENTIALS: &str = r#"{"id":"id","key_pkcs8":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJVWC_QzOTCS5vtsJp2IG-UDc8cdDfeoKtxSZxaznM-mhRANCAAQenCPoGgPFTdPJ7VLLKt56RxPlYT1wNXnHc54PEyBg3LxKaH0-sJkX0mL8LyPEdsfL_Oz4TxHkWLJGrXVtNhfH","urls":{"newNonce":"new-nonce","newAccount":"new-acct","newOrder":"new-order", "revokeCert": "revoke-cert"}}"#;
+        Account::from_credentials(serde_json::from_str::<AccountCredentials>(CREDENTIALS)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_new_credentials() -> Result<(), Error> {
+        const CREDENTIALS: &str = r#"{"id":"id","key_pkcs8":"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJVWC_QzOTCS5vtsJp2IG-UDc8cdDfeoKtxSZxaznM-mhRANCAAQenCPoGgPFTdPJ7VLLKt56RxPlYT1wNXnHc54PEyBg3LxKaH0-sJkX0mL8LyPEdsfL_Oz4TxHkWLJGrXVtNhfH","directory":"https://acme-staging-v02.api.letsencrypt.org/directory"}"#;
+        Account::from_credentials(serde_json::from_str::<AccountCredentials>(CREDENTIALS)?)?;
+        Ok(())
+    }
+}

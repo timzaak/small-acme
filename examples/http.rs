@@ -18,13 +18,14 @@ fn main() -> anyhow::Result<()> {
     // Alternatively, restore an account from serialized credentials by
     // using `Account::from_credentials()`.
 
-    let account = Account::create(
+    let (account, credentials) = Account::create(
         &NewAccount {
             contact: &[],
             terms_of_service_agreed: true,
             only_return_existing: false,
         },
         LetsEncrypt::Staging.url(),
+        None,
     )?;
 
     // Create the ACME order based on the given domain names.
@@ -32,18 +33,19 @@ fn main() -> anyhow::Result<()> {
     // process multiple orders in parallel for a single account.
 
     let identifier = Identifier::Dns(opts.name);
-    let (mut order, state) = account
+    let mut order = account
         .new_order(&NewOrder {
             identifiers: &[identifier],
         })
         .unwrap();
 
+    let state = order.state();
     info!("order state: {:#?}", state);
     assert!(matches!(state.status, OrderStatus::Pending));
 
     // Pick the desired challenge type and prepare the response.
 
-    let authorizations = order.authorizations(&state.authorizations).unwrap();
+    let authorizations = order.authorizations().unwrap();
     let mut challenges = Vec::with_capacity(authorizations.len());
     for authz in &authorizations {
         match authz.status {
@@ -83,8 +85,9 @@ fn main() -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(250);
     let state = loop {
         sleep(delay);
-        let state = order.state().unwrap();
-        if let OrderStatus::Ready | OrderStatus::Invalid = state.status {
+        order.refresh().unwrap();
+        let state = order.state();
+        if let OrderStatus::Ready | OrderStatus::Invalid | OrderStatus::Valid = state.status {
             info!("order state: {:#?}", state);
             break state;
         }
@@ -119,12 +122,23 @@ fn main() -> anyhow::Result<()> {
 
     // Finalize the order and print certificate chain, private key and account credentials.
 
-    let cert_chain_pem = order.finalize(&csr, &state.finalize).unwrap();
-    info!("certficate chain:\n\n{}", cert_chain_pem,);
+    order.finalize(&csr).unwrap();
+    tries = 0;
+    let cert_chain_pem = loop {
+        match order.certificate().unwrap() {
+            Some(cert_chain_pem) => break cert_chain_pem,
+            None => sleep(Duration::from_secs(1)),
+        }
+        tries +=1;
+        if tries > 10 {
+            panic!("No cert received");
+        }
+    };
+    info!("certficate chain:\n\n{:?}", cert_chain_pem,);
     info!("private key:\n\n{}", cert.serialize_private_key_pem());
     info!(
         "account credentials:\n\n{}",
-        serde_json::to_string_pretty(&account.credentials()).unwrap()
+        serde_json::to_string_pretty(&credentials).unwrap()
     );
 
     Ok(())

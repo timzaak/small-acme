@@ -1,6 +1,6 @@
 [package]
 name = "small-acme"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Small pure-Rust ACME client"
@@ -13,7 +13,8 @@ rust-version = "1.60.0"
 
 [dependencies]
 base64 = "0.21"
-ring = { version = "0.16", features = ["std"] }
+ring = { version = "0.17", features = ["std"] }
+rustls-pki-types = "1.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
@@ -22,6 +23,6 @@ ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-env_logger = { version = "0.10.0", default-features = false, features = ["auto-color"] }
-log = "0.4.17"
-rcgen = "0.10"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+log = "0.4"
+rcgen = "0.12"

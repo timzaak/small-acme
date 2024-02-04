@@ -1,21 +1,22 @@
-use std::borrow::Cow;
 use std::fmt;
 
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use ring::digest::{digest, Digest, SHA256};
 use ring::signature::{EcdsaKeyPair, KeyPair};
+use rustls_pki_types::CertificateDer;
 use serde::de::DeserializeOwned;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ureq::Response;
 
-/// Error type for small-acme
+/// Error type for instant-acme
 #[derive(Debug, Error)]
 pub enum Error {
     /// An JSON problem as returned by the ACME server
     ///
     /// RFC 8555 uses problem documents as described in RFC 7807.
-    #[error("API error: {0}")]
+    #[error(transparent)]
     Api(#[from] Problem),
     /// Failed to base64-decode data
     #[error("base64 decoding failed: {0}")]
@@ -27,7 +28,7 @@ pub enum Error {
     #[error("invalid key bytes: {0}")]
     CryptoKey(#[from] ring::error::KeyRejected),
     /// HTTP request failure
-    #[error("HTTP request failure: {0:?}")]
+    #[error("HTTP request failure: {0}")]
     Http(#[from] Box<ureq::Error>),
     /// HTTP IO failure
     #[error("HTTP IO failure: {0}")]
@@ -58,24 +59,65 @@ impl From<&'static str> for Error {
 /// the account credentials to a file or secret manager and restore the
 /// account from persistent storage.
 #[derive(Deserialize, Serialize)]
-pub struct AccountCredentials<'a> {
-    pub(crate) id: Cow<'a, str>,
-    pub(crate) key_pkcs8: String,
-    pub(crate) urls: Cow<'a, DirectoryUrls>,
+pub struct AccountCredentials {
+    pub(crate) id: String,
+    /// Stored in DER, serialized as base64
+    #[serde(with = "pkcs8_serde")]
+    pub(crate) key_pkcs8: Vec<u8>,
+    pub(crate) directory: Option<String>,
+    pub(crate) urls: Option<DirectoryUrls>,
+}
+
+mod pkcs8_serde {
+    use std::fmt;
+
+    use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
+    use serde::{de, Deserializer, Serializer};
+
+    pub(crate) fn serialize<S>(key_pkcs8: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(key_pkcs8.as_ref());
+        serializer.serialize_str(&encoded)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a base64-encoded PKCS#8 private key")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Vec<u8>, E>
+            where
+                E: de::Error,
+            {
+                BASE64_URL_SAFE_NO_PAD.decode(v).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(Visitor)
+    }
 }
 
 /// An RFC 7807 problem document as returned by the ACME server
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Problem {
     /// One of an enumerated list of problem types
     ///
     /// See <https://datatracker.ietf.org/doc/html/rfc8555#section-6.7>
-    pub r#type: String,
+    pub r#type: Option<String>,
     /// A human-readable explanation of the problem
-    pub detail: String,
+    pub detail: Option<String>,
     /// The HTTP status code returned for this response
-    pub status: u16,
+    pub status: Option<u16>,
 }
 
 impl Problem {
@@ -86,7 +128,7 @@ impl Problem {
     pub(crate) fn from_response(rsp: Response) -> Result<Vec<u8>, Error> {
         let status = rsp.status();
         let mut body = Vec::new();
-        rsp.into_reader().read_to_end(&mut body)?;
+        rsp.into_reader().read_to_end(&mut body).map_err(Error::HttpIo)?;
         if (100..=399).contains(&status) {
             return Ok(body);
         }
@@ -97,7 +139,16 @@ impl Problem {
 
 impl fmt::Display for Problem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "API error: {} ({})", self.detail, self.r#type)
+        f.write_str("API error")?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+
+        if let Some(r#type) = &self.r#type {
+            write!(f, " ({})", r#type)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -121,7 +172,8 @@ pub(crate) struct Header<'a> {
     pub(crate) alg: SigningAlgorithm,
     #[serde(flatten)]
     pub(crate) key: KeyOrKeyId<'a>,
-    pub(crate) nonce: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) nonce: Option<&'a str>,
     pub(crate) url: &'a str,
 }
 
@@ -233,6 +285,61 @@ pub struct NewOrder<'a> {
     pub identifiers: &'a [Identifier],
 }
 
+/// Payload for a certificate revocation request
+/// Defined in <https://datatracker.ietf.org/doc/html/rfc8555#section-7.6>
+#[derive(Debug)]
+pub struct RevocationRequest<'a> {
+    /// The certificate to revoke
+    pub certificate: &'a CertificateDer<'a>,
+    /// Reason for revocation
+    pub reason: Option<RevocationReason>,
+}
+
+impl<'a> Serialize for RevocationRequest<'a> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let base64 = BASE64_URL_SAFE_NO_PAD.encode(self.certificate);
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("certificate", &base64)?;
+        if let Some(reason) = &self.reason {
+            map.serialize_entry("reason", reason)?;
+        }
+        map.end()
+    }
+}
+
+/// The reason for a certificate revocation
+/// Defined in <https://datatracker.ietf.org/doc/html/rfc5280#section-5.3.1>
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+#[repr(u8)]
+pub enum RevocationReason {
+    Unspecified = 0,
+    KeyCompromise = 1,
+    CaCompromise = 2,
+    AffiliationChanged = 3,
+    Superseded = 4,
+    CessationOfOperation = 5,
+    CertificateHold = 6,
+    RemoveFromCrl = 8,
+    PrivilegeWithdrawn = 9,
+    AaCompromise = 10,
+}
+
+impl Serialize for RevocationReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.clone() as u8)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NewAccountPayload<'a> {
+    #[serde(flatten)]
+    pub(crate) new_account: &'a NewAccount<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) external_account_binding: Option<JoseJson>,
+}
+
 /// Input data for [Account](crate::Account) creation
 ///
 /// To be passed into [Account::create()](crate::Account::create()).
@@ -255,6 +362,7 @@ pub(crate) struct DirectoryUrls {
     pub(crate) new_nonce: String,
     pub(crate) new_account: String,
     pub(crate) new_order: String,
+    pub(crate) revoke_cert: String,
 }
 
 #[derive(Serialize)]
@@ -262,6 +370,40 @@ pub(crate) struct JoseJson {
     pub(crate) protected: String,
     pub(crate) payload: String,
     pub(crate) signature: String,
+}
+
+impl JoseJson {
+    pub(crate) fn new(
+        payload: Option<&impl Serialize>,
+        protected: Header<'_>,
+        signer: &impl Signer,
+    ) -> Result<Self, Error> {
+        let protected = base64(&protected)?;
+        let payload = match payload {
+            Some(data) => base64(&data)?,
+            None => String::new(),
+        };
+
+        let combined = format!("{protected}.{payload}");
+        let signature = signer.sign(combined.as_bytes())?;
+        Ok(Self {
+            protected,
+            payload,
+            signature: BASE64_URL_SAFE_NO_PAD.encode(signature.as_ref()),
+        })
+    }
+}
+
+pub(crate) trait Signer {
+    type Signature: AsRef<[u8]>;
+
+    fn header<'n, 'u: 'n, 's: 'u>(&'s self, nonce: Option<&'n str>, url: &'u str) -> Header<'n>;
+
+    fn sign(&self, payload: &[u8]) -> Result<Self::Signature, Error>;
+}
+
+fn base64(data: &impl Serialize) -> Result<String, serde_json::Error> {
+    Ok(BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(data)?))
 }
 
 /// An ACME authorization as described in RFC 8555 (section 7.1.4)
@@ -278,7 +420,7 @@ pub struct Authorization {
 
 /// Status for an [`Authorization`]
 #[allow(missing_docs)]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthorizationStatus {
     Pending,
@@ -308,7 +450,7 @@ pub enum ChallengeType {
     TlsAlpn01,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChallengeStatus {
     Pending,
@@ -319,7 +461,7 @@ pub enum ChallengeStatus {
 
 /// Status of an [Order](crate::Order)
 #[allow(missing_docs)]
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderStatus {
     Pending,
@@ -341,8 +483,24 @@ impl LetsEncrypt {
     /// Get the directory URL for the given Let's Encrypt server
     pub const fn url(&self) -> &'static str {
         match self {
-            LetsEncrypt::Production => "https://acme-v02.api.letsencrypt.org/directory",
-            LetsEncrypt::Staging => "https://acme-staging-v02.api.letsencrypt.org/directory",
+            Self::Production => "https://acme-v02.api.letsencrypt.org/directory",
+            Self::Staging => "https://acme-staging-v02.api.letsencrypt.org/directory",
+        }
+    }
+}
+
+/// ZeroSSL ACME only supports production at the moment
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug)]
+pub enum ZeroSsl {
+    Production,
+}
+
+impl ZeroSsl {
+    /// Get the directory URL for the given ZeroSSL server
+    pub const fn url(&self) -> &'static str {
+        match self {
+            Self::Production => "https://acme.zerossl.com/v2/DV90",
         }
     }
 }
@@ -352,6 +510,8 @@ impl LetsEncrypt {
 pub(crate) enum SigningAlgorithm {
     /// ECDSA using P-256 and SHA-256
     Es256,
+    /// HMAC with SHA-256,
+    Hs256,
 }
 
 #[derive(Debug, Serialize)]
