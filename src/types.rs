@@ -128,7 +128,9 @@ impl Problem {
     pub(crate) fn from_response(rsp: Response) -> Result<Vec<u8>, Error> {
         let status = rsp.status();
         let mut body = Vec::new();
-        rsp.into_reader().read_to_end(&mut body).map_err(Error::HttpIo)?;
+        rsp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(Error::HttpIo)?;
         if (100..=399).contains(&status) {
             return Ok(body);
         }

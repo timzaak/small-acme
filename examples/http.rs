@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
             Some(cert_chain_pem) => break cert_chain_pem,
             None => sleep(Duration::from_secs(1)),
         }
-        tries +=1;
+        tries += 1;
         if tries > 10 {
             panic!("No cert received");
         }
