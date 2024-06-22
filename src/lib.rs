@@ -26,7 +26,7 @@ use types::{
     DirectoryUrls, Empty, FinalizeRequest, Header, JoseJson, Jwk, KeyOrKeyId, NewAccountPayload,
     Signer, SigningAlgorithm,
 };
-use ureq::Response;
+use ureq::{Agent, Response};
 
 /// An ACME order as described in RFC 8555 (section 7.1.3)
 ///
@@ -232,6 +232,24 @@ impl Account {
         )
     }
 
+    /// Create a new account with a custom HTTP client
+    ///
+    /// The returned [`AccountCredentials`] can be serialized and stored for later use.
+    /// Use [`Account::from_credentials()`] to restore the account from the credentials.
+    pub fn create_with_agent(
+        account: &NewAccount<'_>,
+        server_url: &str,
+        external_account: Option<&ExternalAccountKey>,
+        agent: Agent,
+    ) -> Result<(Account, AccountCredentials), Error> {
+        Self::create_inner(
+            account,
+            external_account,
+            Client::new_with_agent(agent, server_url)?,
+            server_url,
+        )
+    }
+
     fn create_inner(
         account: &NewAccount<'_>,
         external_account: Option<&ExternalAccountKey>,
@@ -378,7 +396,10 @@ struct Client {
 
 impl Client {
     fn new(server_url: &str) -> Result<Self, Error> {
-        let client = client();
+        Self::new_with_agent(client(), server_url)
+    }
+
+    fn new_with_agent(client: Agent, server_url: &str) -> Result<Self, Error> {
         let rsp = client.get(server_url).call()?;
         let urls = rsp.into_json()?;
         Ok(Client { client, urls })
