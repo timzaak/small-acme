@@ -192,8 +192,18 @@ impl Account {
     ///
     /// The [`AccountCredentials`] type is opaque, but supports deserialization.
     pub fn from_credentials(credentials: AccountCredentials) -> Result<Self, Error> {
+        Self::from_credentials_with_agent(credentials, client())
+    }
+
+    /// Restore an existing account from the given credentials and HTTP client
+    ///
+    /// The [`AccountCredentials`] type is opaque, but supports deserialization.
+    pub fn from_credentials_with_agent(
+        credentials: AccountCredentials,
+        agent: Agent,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            inner: Arc::new(AccountInner::from_credentials(credentials)?),
+            inner: Arc::new(AccountInner::from_credentials(credentials, agent)?),
         })
     }
 
@@ -210,7 +220,7 @@ impl Account {
             inner: Arc::new(AccountInner {
                 id,
                 key: Key::from_pkcs8_der(key_pkcs8_der)?,
-                client: Client::new(directory_url)?,
+                client: Client::new(client(), directory_url)?,
             }),
         })
     }
@@ -227,7 +237,7 @@ impl Account {
         Self::create_inner(
             account,
             external_account,
-            Client::new(server_url)?,
+            Client::new(client(), server_url)?,
             server_url,
         )
     }
@@ -245,7 +255,7 @@ impl Account {
         Self::create_inner(
             account,
             external_account,
-            Client::new_with_agent(agent, server_url)?,
+            Client::new(agent, server_url)?,
             server_url,
         )
     }
@@ -340,14 +350,14 @@ struct AccountInner {
 }
 
 impl AccountInner {
-    fn from_credentials(credentials: AccountCredentials) -> Result<Self, Error> {
+    fn from_credentials(credentials: AccountCredentials, agent: Agent) -> Result<Self, Error> {
         Ok(Self {
             id: credentials.id,
             key: Key::from_pkcs8_der(credentials.key_pkcs8.as_ref())?,
             client: match (credentials.directory, credentials.urls) {
-                (Some(server_url), _) => Client::new(&server_url)?,
+                (Some(server_url), _) => Client::new(agent, &server_url)?,
                 (None, Some(urls)) => Client {
-                    client: client(),
+                    client: agent,
                     urls,
                 },
                 (None, None) => return Err("no server URLs found".into()),
@@ -395,11 +405,7 @@ struct Client {
 }
 
 impl Client {
-    fn new(server_url: &str) -> Result<Self, Error> {
-        Self::new_with_agent(client(), server_url)
-    }
-
-    fn new_with_agent(client: Agent, server_url: &str) -> Result<Self, Error> {
+    fn new(client: Agent, server_url: &str) -> Result<Self, Error> {
         let rsp = client.get(server_url).call()?;
         let urls = rsp.into_json()?;
         Ok(Client { client, urls })
