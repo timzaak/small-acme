@@ -1,5 +1,4 @@
 use std::fmt;
-
 use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use ring::digest::{digest, Digest, SHA256};
 use ring::signature::{EcdsaKeyPair, KeyPair};
@@ -8,7 +7,9 @@ use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use ureq::Response;
+use ureq::Body;
+use ureq::http::header::ToStrError;
+use ureq::http::response::Response;
 
 /// Error type for instant-acme
 #[derive(Debug, Error)]
@@ -39,6 +40,9 @@ pub enum Error {
     /// Miscellaneous errors
     #[error("missing data: {0}")]
     Str(&'static str),
+    /// HTTP parser to String Error
+    #[error("invalid data: {0}")]
+    HttpParser(ToStrError)
 }
 impl From<ureq::Error> for Error {
     fn from(value: ureq::Error) -> Self {
@@ -121,21 +125,18 @@ pub struct Problem {
 }
 
 impl Problem {
-    pub(crate) fn check<T: DeserializeOwned>(rsp: Response) -> Result<T, Error> {
-        rsp.into_json().map_err(Error::HttpIo)
+    pub(crate) fn check<T: DeserializeOwned>(mut rsp: Response<Body>) -> Result<T, Error> {
+        rsp.body_mut().read_json().map_err(|e|Error::Http(Box::new(e)))
     }
 
-    pub(crate) fn from_response(rsp: Response) -> Result<Vec<u8>, Error> {
+    pub(crate) fn from_response(mut rsp: Response<Body>) -> Result<Vec<u8>, Error> {
         let status = rsp.status();
-        let mut body = Vec::new();
-        rsp.into_reader()
-            .read_to_end(&mut body)
-            .map_err(Error::HttpIo)?;
-        if (100..=399).contains(&status) {
-            return Ok(body);
+        let value = rsp.body_mut().read_to_vec()
+            .map_err(|e|Error::Http(Box::new(e)))?;
+        if (100..=399).contains(&status.as_u16()) {
+            return Ok(value);
         }
-
-        Err(serde_json::from_slice::<Problem>(&body)?.into())
+        Err(serde_json::from_slice::<Problem>(&value)?.into())
     }
 }
 

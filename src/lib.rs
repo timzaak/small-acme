@@ -26,7 +26,7 @@ use types::{
     DirectoryUrls, Empty, FinalizeRequest, Header, JoseJson, Jwk, KeyOrKeyId, NewAccountPayload,
     Signer, SigningAlgorithm,
 };
-use ureq::{Agent, Response};
+use ureq::{Agent, http::response::Response, Body};
 
 /// An ACME order as described in RFC 8555 (section 7.1.3)
 ///
@@ -281,12 +281,12 @@ impl Account {
         };
 
         let rsp = client.post(Some(&payload), None, &key, &client.urls.new_account)?;
-
-        let account_url = rsp.header("LOCATION").map(|s| s.to_owned());
+        let account_url = rsp.headers().get("LOCATION").ok_or("failed to get account URL")?.to_str()
+            .map_err(Error::HttpParser)?.to_string();
 
         // The response redirects, we don't need the body
         let _ = Problem::from_response(rsp)?;
-        let id = account_url.ok_or("failed to get account URL")?;
+        let id = account_url;
         let credentials = AccountCredentials {
             id: id.clone(),
             key_pkcs8: key_pkcs8.as_ref().to_vec(),
@@ -319,7 +319,10 @@ impl Account {
             .post(Some(order), None, &self.inner.client.urls.new_order)?;
 
         let nonce = nonce_from_response(&rsp);
-        let order_url = rsp.header("LOCATION").map(|s| s.to_owned());
+        let order_url = 
+            rsp.headers().get("LOCATION").ok_or(Error::Str("No Location Header"))?.to_str()
+                .map_err(Error::HttpParser)?.to_string();
+        //let order_url = rsp.header("LOCATION").map(|s| s.to_owned());
 
         Ok(Order {
             account: self.inner.clone(),
@@ -328,7 +331,7 @@ impl Account {
             // before emitting an error if there is no order url. Or the
             // simple no url error hides the causing error in `Problem::check`.
             state: Problem::check::<OrderState>(rsp)?,
-            url: order_url.ok_or("no order URL found")?,
+            url: order_url,
         })
     }
 
@@ -376,7 +379,7 @@ impl AccountInner {
         payload: Option<&impl Serialize>,
         nonce: Option<String>,
         url: &str,
-    ) -> Result<Response, Error> {
+    ) -> Result<Response<Body>, Error> {
         self.client.post(payload, nonce, self, url)
     }
 }
@@ -406,8 +409,8 @@ struct Client {
 
 impl Client {
     fn new(client: Agent, server_url: &str) -> Result<Self, Error> {
-        let rsp = client.get(server_url).call()?;
-        let urls = rsp.into_json()?;
+        let mut rsp = client.get(server_url).call()?;
+        let urls = rsp.body_mut().read_json()?;
         Ok(Client { client, urls })
     }
 
@@ -417,13 +420,14 @@ impl Client {
         nonce: Option<String>,
         signer: &impl Signer,
         url: &str,
-    ) -> Result<Response, Error> {
+    ) -> Result<Response<Body>, Error> {
         let nonce = self.nonce(nonce)?;
         let body = JoseJson::new(payload, signer.header(Some(&nonce), url), signer)?;
+        
         let rsp = self
             .client
-            .request("POST", url)
-            .set("CONTENT-TYPE", JOSE_JSON)
+            .post(url)
+            .content_type(JOSE_JSON)
             .send_json(body)?;
         Ok(rsp)
     }
@@ -433,7 +437,7 @@ impl Client {
             return Ok(nonce);
         }
 
-        let rsp = self.client.request("HEAD", &self.urls.new_nonce).call()?;
+        let rsp = self.client.head(&self.urls.new_nonce).call()?;
         // https://datatracker.ietf.org/doc/html/rfc8555#section-7.2
         // "The server's response MUST include a Replay-Nonce header field containing a fresh
         // nonce and SHOULD have status code 200 (OK)."
@@ -592,12 +596,16 @@ impl Signer for ExternalAccountKey {
     }
 }
 
-fn nonce_from_response(rsp: &Response) -> Option<String> {
-    rsp.header(REPLAY_NONCE).map(ToOwned::to_owned)
+fn nonce_from_response(rsp: &Response<Body>) -> Option<String> {
+    match rsp.headers().get(REPLAY_NONCE)?
+        .to_str() {
+        Ok(d) => Some(d.to_string()),
+        Err(_) => None,
+    }
 }
 
-fn client() -> ureq::Agent {
-    ureq::builder().https_only(true).build()
+fn client() -> Agent {
+    Agent::config_builder().https_only(true).build().into()
 }
 
 const JOSE_JSON: &str = "application/jose+json";
